@@ -1189,10 +1189,15 @@ export default function App() {
 
   const checklist = useMemo(() => generateChecklist(state), [state]);
   const allChecks = useMemo(() => checklist.flatMap((c) => c.checks), [checklist]);
-  const checkedCount = useMemo(
-    () => allChecks.filter((_, i, arr) => checked[checkKey(arr, i)]).length,
-    [allChecks, checked]
-  );
+  const checkedCount = useMemo(() => {
+    let n = 0;
+    checklist.forEach((cat) => {
+      cat.checks.forEach((c, i) => {
+        if (checked[checkRowKey(cat.category, i, c.text)]) n++;
+      });
+    });
+    return n;
+  }, [checklist, checked]);
   const blockerCount = allChecks.filter((c) => c.priority === "blocker").length;
   const highCount = allChecks.filter((c) => c.priority === "high").length;
 
@@ -1304,9 +1309,10 @@ export default function App() {
   );
 }
 
-function checkKey(arr, idx) {
-  const item = arr[idx];
-  return `${idx}-${item.text.slice(0, 32)}`;
+// Canonical key for a check row — must match what the checkbox UI uses
+// in StepResults so progress counting / export pick up the same boxes.
+function checkRowKey(category, idx, text) {
+  return `${category}-${idx}-${text.slice(0, 32)}`;
 }
 
 /* ───────── STEPS ───────── */
@@ -1551,43 +1557,55 @@ function StepResults({
       .filter((cat) => cat.checks.length > 0);
   }, [checklist, filter]);
 
-  const downloadPdf = () => {
-    const html = buildPrintHtml({ conn, cloud, loc, net, state, checklist });
-    const win = window.open("", "_blank");
-    if (!win) {
-      alert("Pop-up blocked — allow pop-ups for this site to export PDF.");
-      return;
-    }
-    win.document.open();
-    win.document.write(html);
-    win.document.close();
-    const triggerPrint = () => {
-      win.focus();
-      win.print();
-    };
-    if (win.document.readyState === "complete") {
-      setTimeout(triggerPrint, 100);
-    } else {
-      win.addEventListener("load", () => setTimeout(triggerPrint, 100));
-    }
-  };
+  // Counts of remaining items by priority across the whole checklist
+  const exportSummary = useMemo(() => {
+    let total = 0, done = 0, blockerRem = 0, highRem = 0;
+    checklist.forEach((cat) => {
+      cat.checks.forEach((c, i) => {
+        total++;
+        const isDone = !!checked[checkRowKey(cat.category, i, c.text)];
+        if (isDone) done++;
+        else if (c.priority === "blocker") blockerRem++;
+        else if (c.priority === "high") highRem++;
+      });
+    });
+    return { total, done, blockerRem, highRem, pct: total ? Math.round((done / total) * 100) : 0 };
+  }, [checklist, checked]);
 
   const downloadMd = () => {
     const lines = [];
     lines.push(`# Lakeflow Connect Pre-Flight Checklist`);
-    lines.push(`\n**Connector:** ${conn?.label}`);
+    lines.push("");
+    lines.push(`**Connector:** ${conn?.label}`);
     lines.push(`**Cloud:** ${cloud?.label}`);
     lines.push(`**Source location:** ${loc?.label}`);
     lines.push(`**Network model:** ${net?.label}`);
     lines.push(`**Auth:** ${state.authMethod}`);
-    lines.push(`\nGenerated ${new Date().toLocaleString()}\n`);
+    lines.push(`**Generated:** ${new Date().toLocaleString()}`);
+    lines.push("");
     checklist.forEach((cat) => {
-      lines.push(`\n## ${cat.category}`);
-      cat.checks.forEach((c) => {
-        lines.push(`- [ ] **[${c.priority.toUpperCase()}]** ${c.text}`);
+      lines.push(`## ${cat.category}`);
+      lines.push("");
+      cat.checks.forEach((c, i) => {
+        const isDone = !!checked[checkRowKey(cat.category, i, c.text)];
+        const box = isDone ? "[x]" : "[ ]";
+        lines.push(`- ${box} **[${c.priority.toUpperCase()}]** ${c.text}`);
         if (c.detail) lines.push(`    > ${c.detail}`);
+        if (c.code) {
+          lines.push("");
+          lines.push("    ```" + c.code.lang);
+          c.code.body.split("\n").forEach((ln) => lines.push("    " + ln));
+          lines.push("    ```");
+        }
       });
+      lines.push("");
     });
+    const { total, done, blockerRem, highRem, pct } = exportSummary;
+    lines.push(`## Summary`);
+    lines.push("");
+    lines.push(`- **Completed:** ${done}/${total} (${pct}%)`);
+    lines.push(`- **Remaining blockers:** ${blockerRem}`);
+    lines.push(`- **Remaining high priority:** ${highRem}`);
     const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1595,6 +1613,14 @@ function StepResults({
     a.download = `lakeflow-checklist-${state.connector}.md`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const downloadPdf = async () => {
+    const { jsPDF } = await import("jspdf");
+    buildPdf({
+      jsPDF, conn, cloud, loc, net, state, checklist, checked,
+      summary: exportSummary,
+    }).save(`lakeflow-checklist-${state.connector}.pdf`);
   };
 
   const copyDoctor = () => {
@@ -1687,7 +1713,7 @@ function StepResults({
       {filteredChecklist.map((cat, ci) => {
         const isOpen = expanded[cat.category] !== false; // default open
         const total = cat.checks.length;
-        const done = cat.checks.filter((c, i) => checked[`${cat.category}-${i}-${c.text.slice(0,32)}`]).length;
+        const done = cat.checks.filter((c, i) => checked[checkRowKey(cat.category, i, c.text)]).length;
         const pct = total ? (done / total) * 100 : 0;
         return (
           <div className="section" key={cat.category}>
@@ -1716,7 +1742,7 @@ function StepResults({
                 {[...cat.checks]
                   .sort((a, b) => (PRIORITY_ORDER[a.priority] ?? 5) - (PRIORITY_ORDER[b.priority] ?? 5))
                   .map((c, i) => {
-                    const key = `${cat.category}-${i}-${c.text.slice(0, 32)}`;
+                    const key = checkRowKey(cat.category, i, c.text);
                     const isChecked = !!checked[key];
                     return (
                       <div key={key} className={`check-row ${isChecked ? "checked" : ""}`}>
@@ -1857,84 +1883,206 @@ function DownloadMenu({ onMarkdown, onPdf }) {
   );
 }
 
-function buildPrintHtml({ conn, cloud, loc, net, state, checklist }) {
-  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
-  const sections = checklist
-    .map((cat) => {
-      const items = cat.checks
-        .map((c) => {
-          const code = c.code
-            ? `<pre class="code"><code>${esc(c.code.body)}</code></pre>`
-            : "";
-          const detail = c.detail ? `<div class="detail">${esc(c.detail)}</div>` : "";
-          return `
-            <li class="check">
-              <div class="check-head">
-                <span class="prio prio-${c.priority}">${c.priority.toUpperCase()}</span>
-                <span class="check-text">${esc(c.text)}</span>
-              </div>
-              ${detail}
-              ${code}
-            </li>`;
-        })
-        .join("");
-      return `
-        <section>
-          <h2>${esc(cat.category)}</h2>
-          <ul class="checks">${items}</ul>
-        </section>`;
-    })
-    .join("");
+// Build a real PDF document with jsPDF — produces a true file download
+// (not a print preview). Layout is flowing, with page breaks handled
+// automatically when y exceeds the bottom margin.
+function buildPdf({ jsPDF, conn, cloud, loc, net, state, checklist, checked, summary }) {
+  const doc = new jsPDF({ unit: "pt", format: "letter" });
 
-  const meta = `
-    <table class="meta">
-      <tr><th>Connector</th><td>${esc(conn?.label)} <span class="muted">(${esc(conn?.status)})</span></td></tr>
-      <tr><th>Cloud</th><td>${esc(cloud?.label)}</td></tr>
-      <tr><th>Source location</th><td>${esc(loc?.label)}</td></tr>
-      <tr><th>Network model</th><td>${esc(net?.label)}</td></tr>
-      <tr><th>Auth</th><td>${esc(state.authMethod)}</td></tr>
-      <tr><th>Generated</th><td>${esc(new Date().toLocaleString())}</td></tr>
-    </table>`;
+  // Page geometry
+  const margin = 48;
+  const pageW = doc.internal.pageSize.getWidth();
+  const pageH = doc.internal.pageSize.getHeight();
+  const contentW = pageW - margin * 2;
+  let y = margin;
 
-  return `<!doctype html>
-<html><head><meta charset="utf-8" />
-<title>Lakeflow Connect Pre-Flight Checklist — ${esc(conn?.label)}</title>
-<style>
-  @page { margin: 18mm 14mm; }
-  * { box-sizing: border-box; }
-  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; color: #111827; margin: 0; padding: 24px; line-height: 1.5; }
-  h1 { font-size: 22px; margin: 0 0 6px; letter-spacing: -0.01em; }
-  h2 { font-size: 15px; margin: 18px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #d1d5db; color: #111827; }
-  .sub { color: #6b7280; font-size: 12px; margin-bottom: 14px; }
-  .meta { border-collapse: collapse; margin-bottom: 20px; width: 100%; font-size: 12px; }
-  .meta th { text-align: left; color: #6b7280; font-weight: 600; padding: 4px 12px 4px 0; white-space: nowrap; width: 1%; }
-  .meta td { padding: 4px 0; }
-  .muted { color: #9ca3af; }
-  .checks { list-style: none; padding: 0; margin: 0; }
-  .check { padding: 8px 0 10px; border-top: 1px solid #e5e7eb; page-break-inside: avoid; }
-  .check:first-child { border-top: none; }
-  .check-head { display: flex; gap: 8px; align-items: baseline; }
-  .check-text { font-weight: 600; font-size: 13px; }
-  .detail { color: #4b5563; font-size: 12px; margin: 4px 0 6px; }
-  .prio { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 9.5px; font-weight: 700; letter-spacing: 0.04em; }
-  .prio-blocker { background: #fee2e2; color: #991b1b; }
-  .prio-high    { background: #fef3c7; color: #92400e; }
-  .prio-medium  { background: #dbeafe; color: #1e40af; }
-  .prio-low     { background: #d1fae5; color: #065f46; }
-  .prio-info    { background: #e5e7eb; color: #374151; }
-  .code { background: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 4px; padding: 8px 10px; margin: 6px 0 0; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; color: #111827; }
-  @media print {
-    body { padding: 0; }
-  }
-</style>
-</head><body>
-  <h1>Lakeflow Connect Pre-Flight Checklist</h1>
-  <div class="sub">${esc(conn?.label)} · ${esc(cloud?.label)} · ${esc(net?.label)}</div>
-  ${meta}
-  ${sections}
-</body></html>`;
+  const PRIO_FILL = {
+    blocker: [254, 226, 226], high: [254, 243, 199], medium: [219, 234, 254],
+    low:     [209, 250, 229], info: [229, 231, 235],
+  };
+  const PRIO_TEXT = {
+    blocker: [153, 27, 27], high: [146, 64, 14], medium: [30, 64, 175],
+    low:     [6, 95, 70],   info: [55, 65, 81],
+  };
+
+  const ensureSpace = (needed) => {
+    if (y + needed > pageH - margin) {
+      doc.addPage();
+      y = margin;
+    }
+  };
+
+  const drawText = (text, opts = {}) => {
+    const {
+      size = 10, style = "normal", color = [17, 24, 39], indent = 0,
+      lineGap = 4, maxW = contentW - indent,
+    } = opts;
+    doc.setFont("helvetica", style);
+    doc.setFontSize(size);
+    doc.setTextColor(...color);
+    const lines = doc.splitTextToSize(String(text ?? ""), maxW);
+    const lineH = size * 1.25;
+    lines.forEach((line) => {
+      ensureSpace(lineH);
+      doc.text(line, margin + indent, y + lineH * 0.8);
+      y += lineH;
+    });
+    y += lineGap;
+  };
+
+  const drawHr = () => {
+    ensureSpace(8);
+    doc.setDrawColor(229, 231, 235);
+    doc.setLineWidth(0.5);
+    doc.line(margin, y, margin + contentW, y);
+    y += 8;
+  };
+
+  const drawCheckbox = (x, cy, checked) => {
+    doc.setDrawColor(107, 114, 128);
+    doc.setLineWidth(0.6);
+    doc.rect(x, cy, 9, 9);
+    if (checked) {
+      doc.setDrawColor(16, 185, 129);
+      doc.setLineWidth(1.2);
+      doc.line(x + 1.5, cy + 4.5, x + 4, cy + 7.5);
+      doc.line(x + 4, cy + 7.5, x + 8, cy + 2);
+    }
+  };
+
+  const drawPrioPill = (priority, x, cy) => {
+    const label = priority.toUpperCase();
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(7.5);
+    const w = doc.getTextWidth(label) + 8;
+    const fill = PRIO_FILL[priority] || PRIO_FILL.info;
+    const text = PRIO_TEXT[priority] || PRIO_TEXT.info;
+    doc.setFillColor(...fill);
+    doc.roundedRect(x, cy, w, 11, 2, 2, "F");
+    doc.setTextColor(...text);
+    doc.text(label, x + 4, cy + 7.8);
+    return w;
+  };
+
+  // ── Header ─────────────────────────────────────────
+  drawText("Lakeflow Connect Pre-Flight Checklist", { size: 18, style: "bold", lineGap: 2 });
+  drawText(
+    `${conn?.label || "—"} · ${cloud?.label || "—"} · ${net?.label || "—"}`,
+    { size: 10, color: [107, 114, 128], lineGap: 12 }
+  );
+
+  // Metadata table
+  const metaRows = [
+    ["Connector", `${conn?.label || "—"}${conn?.status ? `  (${conn.status})` : ""}`],
+    ["Cloud", cloud?.label || "—"],
+    ["Source location", loc?.label || "—"],
+    ["Network model", net?.label || "—"],
+    ["Auth", state.authMethod || "—"],
+    ["Generated", new Date().toLocaleString()],
+  ];
+  metaRows.forEach(([k, v]) => {
+    ensureSpace(14);
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(9);
+    doc.setTextColor(107, 114, 128);
+    doc.text(k, margin, y + 9);
+    doc.setFont("helvetica", "normal");
+    doc.setTextColor(17, 24, 39);
+    const lines = doc.splitTextToSize(String(v), contentW - 120);
+    lines.forEach((ln, i) => {
+      if (i > 0) y += 12;
+      doc.text(ln, margin + 110, y + 9);
+    });
+    y += 14;
+  });
+  y += 8;
+  drawHr();
+
+  // ── Sections ───────────────────────────────────────
+  checklist.forEach((cat) => {
+    ensureSpace(28);
+    drawText(cat.category, { size: 13, style: "bold", lineGap: 6 });
+    cat.checks.forEach((c, i) => {
+      const isDone = !!checked[checkRowKey(cat.category, i, c.text)];
+
+      // Estimate height to keep one check together if possible
+      const textLines = doc.splitTextToSize(c.text, contentW - 90).length;
+      const detailLines = c.detail
+        ? doc.splitTextToSize(c.detail, contentW - 18).length
+        : 0;
+      const codeLines = c.code ? c.code.body.split("\n").length : 0;
+      const approxH =
+        textLines * 12 + detailLines * 11 + codeLines * 9 + 18;
+      ensureSpace(Math.min(approxH, pageH - margin * 2));
+
+      // Checkbox + priority pill + title
+      const rowTop = y;
+      drawCheckbox(margin, rowTop + 2, isDone);
+      const pillX = margin + 16;
+      const pillW = drawPrioPill(c.priority, pillX, rowTop + 1);
+
+      // Title text wraps after the pill
+      const titleX = pillX + pillW + 6;
+      const titleMaxW = contentW - (titleX - margin);
+      doc.setFont("helvetica", isDone ? "normal" : "bold");
+      doc.setFontSize(10.5);
+      doc.setTextColor(isDone ? 107 : 17, isDone ? 114 : 24, isDone ? 128 : 39);
+      const titleLines = doc.splitTextToSize(c.text, titleMaxW);
+      titleLines.forEach((line, idx) => {
+        doc.text(line, titleX, rowTop + 9 + idx * 12);
+      });
+      y = rowTop + Math.max(14, titleLines.length * 12 + 4);
+
+      // Detail text
+      if (c.detail) {
+        drawText(c.detail, {
+          size: 9, color: [75, 85, 99], indent: 16, lineGap: 4,
+        });
+      }
+
+      // Code block
+      if (c.code) {
+        const codeFont = "courier";
+        doc.setFont(codeFont, "normal");
+        doc.setFontSize(8);
+        const codeLines = c.code.body.split("\n").flatMap((ln) =>
+          doc.splitTextToSize(ln || " ", contentW - 32)
+        );
+        const lineH = 10;
+        const blockH = codeLines.length * lineH + 12;
+        ensureSpace(blockH);
+        doc.setFillColor(243, 244, 246);
+        doc.setDrawColor(229, 231, 235);
+        doc.roundedRect(margin + 16, y, contentW - 16, blockH, 3, 3, "FD");
+        doc.setTextColor(17, 24, 39);
+        codeLines.forEach((line, idx) => {
+          doc.text(line, margin + 24, y + 9 + idx * lineH);
+        });
+        y += blockH + 6;
+      }
+
+      y += 4;
+    });
+    y += 6;
+  });
+
+  // ── Summary ────────────────────────────────────────
+  drawHr();
+  drawText("Summary", { size: 13, style: "bold", lineGap: 6 });
+  drawText(
+    `Completed: ${summary.done} / ${summary.total}  (${summary.pct}%)`,
+    { size: 10.5, lineGap: 2 }
+  );
+  drawText(
+    `Remaining blockers: ${summary.blockerRem}`,
+    { size: 10.5, color: PRIO_TEXT.blocker, lineGap: 2 }
+  );
+  drawText(
+    `Remaining high priority: ${summary.highRem}`,
+    { size: 10.5, color: PRIO_TEXT.high, lineGap: 2 }
+  );
+
+  return doc;
 }
 
 function CodeBlock({ code }) {
