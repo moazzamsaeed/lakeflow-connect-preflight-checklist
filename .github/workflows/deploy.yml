@@ -25,12 +25,10 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 5
         run: |
-          npm install -g npm@latest
           npm install \
             --no-audit \
             --no-fund \
             --no-progress \
-            --prefer-offline \
             --fetch-retries 3 \
             --fetch-retry-mintimeout 10000 \
             --fetch-retry-maxtimeout 60000 \
