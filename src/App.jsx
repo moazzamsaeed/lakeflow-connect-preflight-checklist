@@ -757,6 +757,11 @@ function genNetwork(state, conn) {
       detail: "Zerobus is a Databricks-side service. Customer-side Private Link / VNet peering / Direct Connect don't apply. Use Service-Direct PL or the public endpoint with IP ACL.",
     });
     checks.push({
+      text: "⚠️ Service-Direct PL is same-cloud + same-region only, AWS / Azure only",
+      priority: "blocker",
+      detail: "The private endpoint lives in your workspace's VNet/VPC — producers outside that cloud (or in a different region) cannot reach it directly. GCP is not yet supported. Cross-region PL is not supported. Cross-cloud / on-prem producers must bridge into a same-cloud network (peering / VPN / ExpressRoute) before using SDPL — otherwise stay on the public endpoint with IP ACL.",
+    });
+    checks.push({
       text: "Quota: 5 service-direct endpoints per region, 100 per account",
       priority: "info",
       detail: "Contact your Databricks account team if you need more.",
@@ -1861,28 +1866,43 @@ export default function App() {
   }, [step]);
 
   // Auto-set source location when the connector implies it.
-  //   SaaS connectors:   source-side is on the SaaS internet endpoint.
-  //   Zerobus variants:  customer pushes into Databricks — there is no
-  //     external source to host. Treat as "saas" for the source-location
-  //     step but leave networkModel for the user (service_direct_pl vs
-  //     public_with_ip_acl).
+  // SaaS connectors: source-side is on the SaaS internet endpoint —
+  // there is no real choice to make. Zerobus producers can run
+  // anywhere (same cloud / cross-cloud / on-prem / SaaS), so we leave
+  // the source-location step open for the user to pick — that choice
+  // gates whether Service-Direct Private Link is even a valid option.
   useEffect(() => {
     if (conn?.category === "SaaS" && state.sourceLocation !== "saas") {
       setState((s) => ({ ...s, sourceLocation: "saas", networkModel: "public_with_ip_acl" }));
-    } else if (conn?.category === "Streaming" && state.sourceLocation !== "saas") {
-      setState((s) => ({ ...s, sourceLocation: "saas", networkModel: null }));
     }
   }, [state.connector]); // eslint-disable-line
 
   const availableNetworkModels = useMemo(() => {
-    // Zerobus is a Databricks-managed service the client pushes to —
-    // generic Private Link / peering / VPN don't apply. Only the
-    // dedicated Service-Direct Private Link, or a public endpoint, are
-    // valid topologies for it.
-    if (state.connector === "zerobus" || state.connector === "zerobus_rest" || state.connector === "zerobus_otlp") {
-      return ["service_direct_pl", "public_with_ip_acl"];
-    }
     const loc = state.sourceLocation;
+    const isZerobus =
+      state.connector === "zerobus" ||
+      state.connector === "zerobus_rest" ||
+      state.connector === "zerobus_otlp";
+
+    // Zerobus: Service-Direct PL only makes sense when the producer
+    // network is in the SAME cloud as the workspace, and only on
+    // AWS/Azure (GCP isn't supported yet per the internal onboarding
+    // doc). Cross-cloud / on-prem producers must reach Databricks
+    // either over the public internet or via bridged connectivity
+    // (peering/VPN into a same-cloud network that then uses SDPL).
+    if (isZerobus) {
+      if (loc === "same_cloud") {
+        const cloudSupportsSDPL = state.cloud === "aws" || state.cloud === "azure";
+        return cloudSupportsSDPL
+          ? ["service_direct_pl", "public_with_ip_acl"]
+          : ["public_with_ip_acl"];
+      }
+      if (loc === "on_prem") return ["vpn_expressroute", "public_with_ip_acl"];
+      if (loc === "different_cloud") return ["cross_cloud_vpn", "public_with_ip_acl"];
+      if (loc === "saas") return ["public_with_ip_acl"];
+      return [];
+    }
+
     if (loc === "saas") return ["public_with_ip_acl"];
     if (loc === "on_prem") return ["vpn_expressroute", "transit_gateway", "public_with_ip_acl"];
     if (loc === "different_cloud") return ["cross_cloud_vpn", "cross_cloud_interconnect", "public_with_ip_acl"];
@@ -2165,15 +2185,20 @@ function StepCloud({ state, set }) {
 
 function StepSource({ state, set, conn }) {
   const isSaaS = conn?.category === "SaaS";
+  const isZerobus = conn?.category === "Streaming";
+  const title = isZerobus
+    ? "Where will your Zerobus producer run?"
+    : "Where does the source system run?";
+  const desc = isSaaS
+    ? `${conn.label} is a SaaS service, so we've auto-selected internet-hosted connectivity.`
+    : isZerobus
+    ? "Service-Direct Private Link only works if the producer runs in the same cloud (AWS or Azure) and same region as your Databricks workspace. Pick where the producer actually runs — that determines whether SDPL is available in the next step."
+    : "This drives which network topology options are available in the next step.";
   return (
     <>
       <div className="step-eyebrow">Step 4 · Source location</div>
-      <h1 className="step-title">Where does the source system run?</h1>
-      <p className="step-desc">
-        {isSaaS
-          ? `${conn.label} is a SaaS service, so we've auto-selected internet-hosted connectivity.`
-          : "This drives which network topology options are available in the next step."}
-      </p>
+      <h1 className="step-title">{title}</h1>
+      <p className="step-desc">{desc}</p>
       <div className="option-list" style={{ maxWidth: 720 }}>
         {SOURCE_LOCATIONS.map((loc) => {
           const sel = state.sourceLocation === loc.id;
