@@ -1955,9 +1955,12 @@ export default function App() {
     return Math.max(m, step);
   }, [state, step]);
 
+  // Clicking the brand goes home AND fully resets — same effect as the
+  // "Restart questionnaire" button on results. This avoids the
+  // surprise where re-starting from the landing page silently resumed
+  // a half-filled form.
   const goHome = () => {
-    setChecked({});
-    setStarted(false);
+    reset();
   };
 
   if (!started) {
