@@ -90,6 +90,19 @@ const CONNECTORS = {
     platforms: "Amazon RDS, Aurora MySQL, Azure DB for MySQL, GCP Cloud SQL, EC2",
     docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/mysql",
   },
+  oracle_cdc: {
+    label: "Oracle (CDC)",
+    icon: "database",
+    status: "Private Preview",
+    defaultPorts: ["1521"],
+    authMethods: ["Database Auth"],
+    supportsPrivateLink: true,
+    category: "Database",
+    cdcMethod: "LogMiner (online + archive logs)",
+    minVersion: "12c, 18c, 19c, 21c, 23ai, 26ai",
+    platforms: "Oracle DB on-prem, AWS RDS (non-multi-tenant), OCI single-tenant",
+    docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/oracle-overview",
+  },
   salesforce: {
     label: "Salesforce",
     icon: "cloud",
@@ -470,6 +483,11 @@ const NETWORK_MODELS = {
     icon: "network",
     desc: "Dedicated circuits via an interconnect partner (Equinix, Megaport, etc).",
   },
+  service_direct_pl: {
+    label: "Service-Direct Private Link",
+    icon: "lock",
+    desc: "Databricks-managed inbound Private Link for performance-intensive services (Zerobus Ingest, Lakebase Autoscaling). Account-level, target sub-resource service_direct.",
+  },
 };
 
 /* ───────── HELPERS ───────── */
@@ -503,33 +521,157 @@ function generateChecklist(state) {
 function genIdentity(state, conn) {
   const checks = [];
   const auth = state.authMethod || conn.authMethods[0];
+  const c = state.connector;
 
-  if (auth === "OAuth 2.0") {
-    checks.push({ text: `Register an OAuth 2.0 application for ${conn.label} with the right scopes`, priority: "high" });
-    checks.push({ text: "Store OAuth client ID and secret in a Databricks Secret Scope", priority: "high" });
-  }
-  if (auth === "OAuth M2M") {
-    checks.push({ text: "Register an Entra ID App Registration for machine-to-machine (client credentials) auth", priority: "high" });
-  }
-  if (auth.includes("Entra") || auth.includes("AAD")) {
-    checks.push({ text: "Create an Entra ID (AAD) App Registration with required permissions on the source", priority: "high" });
-  }
-  if (auth === "SQL Auth" || auth === "Database Auth") {
-    checks.push({ text: `Create a dedicated database service account for Databricks ingestion`, priority: "high", detail: "Grant only the minimum permissions needed for replication / CDC." });
+  // ── Connector-specific identity flows ──
+  if (c === "salesforce") {
     checks.push({
-      text: "Store database credentials in a Databricks Secret Scope",
+      text: "Register a Salesforce Connected App with OAuth 2.0 enabled",
       priority: "high",
-      code: { lang: "bash", body: "# Create a scope\ndatabricks secrets create-scope lakeflow-ingest\n\n# Add username + password\ndatabricks secrets put-secret lakeflow-ingest src_user\ndatabricks secrets put-secret lakeflow-ingest src_password\n\n# Grant the workspace service principal READ on the scope\ndatabricks secrets put-acl lakeflow-ingest \\\n  <pipeline-service-principal-id> READ" },
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/salesforce-concepts",
+      detail: "Setup → App Manager → New Connected App → Enable OAuth Settings. Required scopes: api, refresh_token, offline_access. Set Refresh Token policy to 'Refresh token is valid until revoked'.",
+    });
+    checks.push({ text: "Whitelist the Databricks OAuth callback URL on the Connected App", priority: "high", detail: "URL appears when you click 'Add data → Salesforce' in the workspace." });
+    checks.push({ text: "Verify 'API Enabled' is on for the integration user's profile", priority: "high" });
+  } else if (c === "hubspot") {
+    checks.push({
+      text: "Register a HubSpot Public/Private App for OAuth U2M",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/hubspot-overview",
+      detail: "Lakeflow Connect supports OAuth U2M only — M2M, API-key, and manual refresh-token flows are not supported. Account admin completes the consent during UC Connection creation.",
+    });
+    checks.push({ text: "Pick required scopes: crm.objects.* (read), crm.schemas.*, content, automation", priority: "high" });
+  } else if (c === "jira") {
+    checks.push({
+      text: "Create an Atlassian OAuth 2.0 (3LO) app and add the Databricks callback URL",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/jira-source-setup",
+      detail: "On developer.atlassian.com → 'Authorization' → callback. Required permissions: read:jira-work, read:jira-user, offline_access.",
+    });
+  } else if (c === "confluence") {
+    checks.push({
+      text: "Create an Atlassian OAuth 2.0 (3LO) app for Confluence",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/confluence-source-setup",
+      detail: "Required scopes: read:confluence-content.all, read:confluence-space.summary, offline_access.",
+    });
+  } else if (c === "netsuite") {
+    checks.push({
+      text: "Create a NetSuite Integration record with Token-Based Auth (TBA) or OAuth 2.0",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/netsuite-source-setup",
+      detail: "Setup → Integration → Manage Integrations → New. Enable 'Token-Based Authentication' OR 'OAuth 2.0'. Note the NetSuite Account ID, Consumer Key/Secret, and Token Key/Secret.",
+    });
+    checks.push({ text: "Assign a Role with the SuiteAnalytics Connect / REST Web Services permission to the integration user", priority: "high" });
+  } else if (c === "dynamics_365") {
+    checks.push({
+      text: "Configure Azure Synapse Link for Dataverse on your Dynamics 365 environment",
+      priority: "blocker",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/d365-source-setup",
+      detail: "Lakeflow Connect reads from Dataverse via Synapse Link, not directly. The Synapse Link pipeline writes Delta/CSV/Parquet to an ADLS Gen2 container that Databricks reads.",
+    });
+    checks.push({ text: "Register an Entra ID app + grant access to the Dataverse environment", priority: "high" });
+  } else if (c === "zendesk") {
+    checks.push({
+      text: "Create a Zendesk OAuth 2.0 client (preferred) or generate an API token",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/zendesk-support-overview",
+      detail: "Admin Center → Apps and integrations → APIs → Zendesk API. OAuth is preferred for refreshability; API tokens are simpler but require periodic rotation.",
+    });
+  } else if (c === "google_ads") {
+    checks.push({
+      text: "Apply for a Google Ads developer token and create OAuth 2.0 credentials in GCP",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/google-ads-overview",
+      detail: "Developer tokens require approval from Google before higher-than-basic API access tiers. Plan for the approval lead time before scheduling go-live.",
+    });
+  } else if (c === "meta_ads" || c === "tiktok_ads") {
+    checks.push({
+      text: `Register a ${conn.label} business / developer app and configure OAuth 2.0`,
+      priority: "high",
+      docsUrl: conn.docsUrl,
+      detail: "Use a System User (Meta) or Business app (TikTok). Personal-user tokens expire too quickly for production ingestion.",
+    });
+  } else if (c === "workday" || c === "workday_hcm") {
+    checks.push({
+      text: "Create a Workday Integration System User (ISU) with the required Domain Security Policies",
+      priority: "high",
+      docsUrl: conn.docsUrl,
+      detail: "Workbench → Create ISU → assign to an Integration System Security Group. For Workday HCM, the group needs Get/Put permissions on the data domains exposed via the Custom Reports.",
+    });
+  } else if (c === "servicenow") {
+    checks.push({
+      text: "Create a ServiceNow OAuth client (preferred) or a Basic-Auth integration user",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/servicenow-source-setup",
+      detail: "System OAuth → Application Registry → New → Create an OAuth API endpoint for external clients. Basic Auth works but rotate credentials frequently.",
+    });
+  } else if (c === "sharepoint") {
+    checks.push({
+      text: "Register an Entra ID app with Microsoft Graph Sites.Read.All or Sites.Selected",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/sharepoint-source-setup-overview",
+      detail: "Sites.Selected is the least-privilege option — combine with site-specific grants via PowerShell/Graph.",
+    });
+  } else if (c === "google_analytics") {
+    checks.push({
+      text: "Create a GCP Service Account and grant Viewer role on the GA4 property",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/google-analytics",
+    });
+    checks.push({ text: "Note the GA4 Property ID", priority: "high", detail: "GA4 Admin → Property Settings → Property ID." });
+  } else if (c === "zerobus") {
+    checks.push({
+      text: "Create a Databricks service principal for the Zerobus producer",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/zerobus-overview",
+      detail: "Account-level service principal — used by the producer to obtain OAuth M2M tokens via /oidc/v1/token.",
+    });
+    checks.push({ text: "Generate an OAuth M2M client secret and store it where the producer runs", priority: "high" });
+    checks.push({ text: "Grant the service principal MODIFY on the target Delta tables (and USE on catalog/schema)", priority: "high" });
+  } else if (c === "zerobus_rest") {
+    checks.push({
+      text: "Create a Databricks service principal (or use a PAT) for the REST client",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/zerobus-ingest",
+      detail: "Service principal + OAuth M2M is preferred for production. PATs work for prototyping but expire and don't rotate cleanly.",
+    });
+    checks.push({ text: "Grant the principal MODIFY on the target tables", priority: "high" });
+  } else if (c === "zerobus_otlp") {
+    checks.push({
+      text: "Create a Databricks service principal for the OpenTelemetry exporter",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/opentelemetry/",
+      detail: "Set OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer\\ <m2m-token> on the SDK/Collector. Refresh the token before expiry.",
+    });
+  } else if (c === "github_community" || c === "stripe_community") {
+    checks.push({
+      text: `Provision a ${conn.label} ${conn.authMethods[0]}`,
+      priority: "high",
+      docsUrl: "https://github.com/databrickslabs/lakeflow-community-connectors",
+      detail: "Community connectors run as user code — the credential is read by your DLT/Job notebook, not a managed UC Connection.",
     });
   }
-  if (auth === "ISU Credentials") {
-    checks.push({ text: "Create a Workday Integration System User (ISU) with the required Integration System Security Group", priority: "high" });
-  }
-  if (auth === "Service Account Key") {
-    checks.push({ text: "Create a GCP Service Account with Analytics Viewer permission and download the JSON key", priority: "high" });
-  }
-  if (auth === "OAuth 2.0 (App Registration)") {
-    checks.push({ text: "Register an Entra ID App with Microsoft Graph Sites.Read.All / Sites.Selected permission", priority: "high" });
+  // ── Generic auth (used for query-based DB connectors and any not handled above) ──
+  else {
+    if (auth === "OAuth 2.0") {
+      checks.push({ text: `Register an OAuth 2.0 application for ${conn.label} with the right scopes`, priority: "high" });
+      checks.push({ text: "Store OAuth client ID and secret in a Databricks Secret Scope", priority: "high" });
+    }
+    if (auth === "OAuth M2M") {
+      checks.push({ text: "Register an Entra ID App Registration for machine-to-machine (client credentials) auth", priority: "high" });
+    }
+    if (auth.includes("Entra") || auth.includes("AAD")) {
+      checks.push({ text: "Create an Entra ID (AAD) App Registration with required permissions on the source", priority: "high" });
+    }
+    if (auth === "SQL Auth" || auth === "Database Auth" || auth === "TD2 (Teradata native)") {
+      checks.push({ text: `Create a dedicated database service account for Databricks ingestion`, priority: "high", detail: "Grant only the minimum permissions needed for replication / CDC / query." });
+      checks.push({
+        text: "Store database credentials in a Databricks Secret Scope",
+        priority: "high",
+        code: { lang: "bash", body: "# Create a scope\ndatabricks secrets create-scope lakeflow-ingest\n\n# Add username + password\ndatabricks secrets put-secret lakeflow-ingest src_user\ndatabricks secrets put-secret lakeflow-ingest src_password\n\n# Grant the workspace service principal READ on the scope\ndatabricks secrets put-acl lakeflow-ingest \\\n  <pipeline-service-principal-id> READ" },
+      });
+    }
   }
 
   checks.push({ text: "Document credential rotation schedule and ownership", priority: "medium" });
@@ -568,6 +710,57 @@ function genNetwork(state, conn) {
       checks.push({ text: "Configure Private DNS zone for endpoint hostname resolution", priority: "high" });
       checks.push({ text: "Verify the Private Endpoint connection status is 'Approved'", priority: "high" });
     }
+  }
+
+  // ── Service-Direct Private Link (Zerobus Ingest, Lakebase Autoscaling)
+  if (net === "service_direct_pl") {
+    const azureDocs = "https://learn.microsoft.com/en-us/azure/databricks/security/network/front-end/service-direct-privatelink";
+    const awsDocs   = "https://docs.databricks.com/aws/en/security/network/front-end/service-direct-privatelink";
+    const cloud     = state.cloud;
+    checks.push({
+      text: "Enroll the account in the 'Private connectivity for performance-intensive services' Public Preview",
+      priority: "blocker",
+      docsUrl: cloud === "azure" ? azureDocs : awsDocs,
+      detail: "Account-level setting — self-enrollment from the account console. Without it, the service_direct sub-resource isn't visible.",
+    });
+    checks.push({
+      text: "Premium tier is required",
+      priority: "blocker",
+      detail: "Service-Direct Private Link is Premium-only on both Azure and AWS.",
+    });
+    checks.push({
+      text: "Create the Service-Direct private endpoint with target sub-resource `service_direct`",
+      priority: "blocker",
+      docsUrl: cloud === "azure" ? azureDocs : awsDocs,
+      detail: cloud === "azure"
+        ? "Connect to the regional Private Link Service resource ID. Sub-resource: service_direct."
+        : "Create a VPC endpoint targeting the regional Service-Direct PrivateLink service for performance-intensive services.",
+      code: cloud === "azure"
+        ? { lang: "bash", body: "# Azure CLI — example. The resource_id comes from the docs table.\naz network private-endpoint create \\\n  --resource-group <rg> \\\n  --name pe-zerobus-<region> \\\n  --vnet-name <vnet> --subnet <subnet> \\\n  --private-connection-resource-id '<service-direct-PLS-id>' \\\n  --group-id service_direct \\\n  --connection-name pe-zerobus-conn" }
+        : { lang: "bash", body: "# AWS CLI — example. Replace service name with the per-region one from docs.\naws ec2 create-vpc-endpoint \\\n  --vpc-id <vpc-id> \\\n  --vpc-endpoint-type Interface \\\n  --service-name com.amazonaws.vpce.<region>.<service-direct-id> \\\n  --subnet-ids <subnet-ids> \\\n  --security-group-ids <sg-id>" },
+    });
+    checks.push({
+      text: "Register the private endpoint in the Databricks account console",
+      priority: "blocker",
+      detail: "Account console → Security → Networking → Endpoints → Register endpoint. The endpoint stays in Pending state until registration completes.",
+    });
+    checks.push({
+      text: "Configure DNS for the service-direct hostname",
+      priority: "blocker",
+      code: cloud === "azure"
+        ? { lang: "bash", body: "# Add an A record in your privatelink.azuredatabricks.net private DNS zone\n#   Name:  <region>.service-direct\n#   IP:    <private endpoint IP>\n\nnslookup <region>.service-direct.privatelink.azuredatabricks.net" }
+        : { lang: "bash", body: "# AWS — confirm DNS resolves to the private endpoint\ndig <region>.service-direct.privatelink.cloud.databricks.com" },
+    });
+    checks.push({
+      text: "⚠️ Generic Private Link is NOT supported for Zerobus — must use Service-Direct",
+      priority: "info",
+      detail: "Zerobus is a Databricks-side service. Customer-side Private Link / VNet peering / Direct Connect don't apply. Use Service-Direct PL or the public endpoint with IP ACL.",
+    });
+    checks.push({
+      text: "Quota: 5 service-direct endpoints per region, 100 per account",
+      priority: "info",
+      detail: "Contact your Databricks account team if you need more.",
+    });
   }
 
   // ── VNet / VPC peering
@@ -826,6 +1019,68 @@ function genSource(state, conn) {
       priority: "high",
       detail: "Inactive slots cause WAL retention forever — disk fills, autovacuum can't reclaim. Drop the slot when retiring the pipeline.",
       code: { lang: "sql", body: "-- After confirming the pipeline is deleted\nSELECT pg_drop_replication_slot('databricks_slot');" },
+    });
+  }
+
+  // ── Oracle CDC (Private Preview, LogMiner-based) ──
+  if (state.connector === "oracle_cdc") {
+    checks.push({
+      text: "Confirm Oracle version is 12c or later (12c / 18c / 19c / 21c / 23ai / 26ai)",
+      priority: "blocker",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/oracle-overview",
+      code: { lang: "sql", body: "SELECT BANNER_FULL FROM V$VERSION;" },
+    });
+    checks.push({
+      text: "Verify ARCHIVELOG mode is enabled",
+      priority: "blocker",
+      detail: "Required for LogMiner to read change history. Databricks recommends retaining archivelogs for at least 48 hours.",
+      code: { lang: "sql", body: "-- Should return 'ARCHIVELOG'\nSELECT LOG_MODE FROM V$DATABASE;\n\n-- If not, switch (downtime + DBA action):\n--   SHUTDOWN IMMEDIATE;\n--   STARTUP MOUNT;\n--   ALTER DATABASE ARCHIVELOG;\n--   ALTER DATABASE OPEN;" },
+    });
+    checks.push({
+      text: "Enable minimal supplemental logging at the database level",
+      priority: "blocker",
+      code: { lang: "sql", body: "-- Non-RDS:\nALTER DATABASE ADD SUPPLEMENTAL LOG DATA;\n\n-- AWS RDS:\nBEGIN\n  rdsadmin.rdsadmin_util.alter_supplemental_logging(\n    p_action => 'ADD');\nEND;\n/" },
+    });
+    checks.push({
+      text: "Enable primary-key supplemental logging on each replicated table",
+      priority: "blocker",
+      detail: "Required so LogMiner can identify rows in UPDATE/DELETE events. RDS uses the rdsadmin helper; non-RDS uses ALTER DATABASE.",
+      code: { lang: "sql", body: "-- Non-RDS\nALTER DATABASE ADD SUPPLEMENTAL LOG DATA (PRIMARY KEY) COLUMNS;\n\n-- AWS RDS\nBEGIN\n  rdsadmin.rdsadmin_util.alter_supplemental_logging(\n    p_action => 'ADD',\n    p_type   => 'PRIMARY KEY');\nEND;\n/" },
+    });
+    checks.push({
+      text: "Run the Databricks Oracle CDC setup script (dbx_oracle_setup_util)",
+      priority: "high",
+      docsUrl: "https://docs.databricks.com/aws/en/ingestion/lakeflow-connect/oracle-overview",
+      detail: "Provided in the Oracle CDC private-preview docs. Creates a PL/SQL package with helpers: run_setup_checks, create_user, grant_permissions. Run as SYSDBA (or ADMIN on RDS).",
+      code: { lang: "sql", body: "-- After loading the dbx_oracle_setup_util package:\nSET SERVEROUTPUT ON\nBEGIN DBX_ORACLE_SETUP_UTIL.RUN_SETUP_CHECKS(); END;\n/" },
+    });
+    checks.push({
+      text: "Create the replication user (use C## prefix for CDB / multi-tenant)",
+      priority: "high",
+      detail: "For container databases the user must be a COMMON user (C## prefix). For non-CDB databases drop the prefix. Do NOT use SYS or SYSTEM.",
+      code: { lang: "sql", body: "-- CDB / multi-tenant\nBEGIN\n  DBX_ORACLE_SETUP_UTIL.CREATE_USER(\n    'C##CDCREPL', '<password>', 'USERS', 'TEMP');\nEND;\n/\n\n-- Non-CDB\nBEGIN\n  DBX_ORACLE_SETUP_UTIL.CREATE_USER(\n    'CDCREPL',   '<password>', 'USERS', 'TEMP');\nEND;\n/" },
+    });
+    checks.push({
+      text: "Grant LogMiner + V$/GV$ privileges to the replication user",
+      priority: "high",
+      detail: "Grants CREATE SESSION, LOGMINING, SELECT ANY TRANSACTION, FLASHBACK ANY TABLE, EXECUTE on DBMS_LOGMNR / DBMS_LOGMNR_D, and SELECT on the V_$/GV_$ logfile + archived-log views. On CDB the user gets CONTAINER_DATA=ALL.",
+      code: { lang: "sql", body: "BEGIN\n  DBX_ORACLE_SETUP_UTIL.GRANT_PERMISSIONS('C##CDCREPL');\nEND;\n/" },
+    });
+    checks.push({
+      text: "⚠️ Verify your environment is supported",
+      priority: "blocker",
+      detail: "Not supported in private preview: Oracle RAC, Exadata in RAC mode, Physical Standby, Oracle Autonomous Databases, multi-tenant AWS RDS instances. Schema (DDL) changes are also not yet supported. Limit ~500 tables per ingestion pipeline.",
+    });
+    checks.push({
+      text: "⚠️ Audit unsupported data types before scoping tables",
+      priority: "high",
+      detail: "LogMiner ignores entire tables that contain BFILE, BOOLEAN, VECTOR, JSON, nested tables, identity columns, temporal validity, PKREF, PKOID. Also avoid 12.2+ data types in tracked columns.",
+      code: { lang: "sql", body: "-- Quick screen for unsupported types in your candidate schemas\nSELECT owner, table_name, column_name, data_type\nFROM   dba_tab_columns\nWHERE  owner IN (<your_schemas>)\nAND    data_type IN ('BFILE', 'BOOLEAN', 'VECTOR', 'JSON');" },
+    });
+    checks.push({
+      text: "Use the CDB$ROOT service name when creating the UC Connection (for multi-tenant)",
+      priority: "high",
+      detail: "Connection-creation UI asks for the database host + service name. For CDB the service name must point at CDB$ROOT, not a pluggable database.",
     });
   }
 
@@ -1605,14 +1860,28 @@ export default function App() {
     scrollRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, [step]);
 
-  // Auto-set SaaS source location when SaaS connector is picked
+  // Auto-set source location when the connector implies it.
+  //   SaaS connectors:   source-side is on the SaaS internet endpoint.
+  //   Zerobus variants:  customer pushes into Databricks — there is no
+  //     external source to host. Treat as "saas" for the source-location
+  //     step but leave networkModel for the user (service_direct_pl vs
+  //     public_with_ip_acl).
   useEffect(() => {
     if (conn?.category === "SaaS" && state.sourceLocation !== "saas") {
       setState((s) => ({ ...s, sourceLocation: "saas", networkModel: "public_with_ip_acl" }));
+    } else if (conn?.category === "Streaming" && state.sourceLocation !== "saas") {
+      setState((s) => ({ ...s, sourceLocation: "saas", networkModel: null }));
     }
   }, [state.connector]); // eslint-disable-line
 
   const availableNetworkModels = useMemo(() => {
+    // Zerobus is a Databricks-managed service the client pushes to —
+    // generic Private Link / peering / VPN don't apply. Only the
+    // dedicated Service-Direct Private Link, or a public endpoint, are
+    // valid topologies for it.
+    if (state.connector === "zerobus" || state.connector === "zerobus_rest" || state.connector === "zerobus_otlp") {
+      return ["service_direct_pl", "public_with_ip_acl"];
+    }
     const loc = state.sourceLocation;
     if (loc === "saas") return ["public_with_ip_acl"];
     if (loc === "on_prem") return ["vpn_expressroute", "transit_gateway", "public_with_ip_acl"];
