@@ -1833,7 +1833,7 @@ function AppFooter() {
 /* ───────── MAIN APP ───────── */
 
 const STEPS = ["Category", "Connector", "Cloud", "Source", "Network", "Auth", "Results"];
-const initialState = { connectorCategory: null, connector: null, cloud: null, sourceLocation: null, networkModel: null, authMethod: null, sourceHost: "" };
+const initialState = { connectorCategory: null, connector: null, cloud: null, sourceLocation: null, networkModel: null, authMethod: null, sourceHost: "", notes: "" };
 
 export default function App() {
   const [started, setStarted] = useState(false);
@@ -1987,6 +1987,7 @@ export default function App() {
             {step === 6 && (
               <StepResults
                 state={state}
+                set={set}
                 checklist={checklist}
                 checked={checked}
                 setChecked={setChecked}
@@ -2317,6 +2318,7 @@ function authBlurb(m, conn) {
 
 function StepResults({
   state,
+  set,
   checklist,
   checked,
   setChecked,
@@ -2394,6 +2396,12 @@ function StepResults({
     lines.push(`- **Completed:** ${done}/${total} (${pct}%)`);
     lines.push(`- **Remaining blockers:** ${blockerRem}`);
     lines.push(`- **Remaining high priority:** ${highRem}`);
+    if (state.notes && state.notes.trim()) {
+      lines.push("");
+      lines.push(`## Describe the situation`);
+      lines.push("");
+      lines.push(state.notes.trim());
+    }
     const blob = new Blob([lines.join("\n")], { type: "text/markdown" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -2609,6 +2617,25 @@ function StepResults({
           </div>
         </div>
       )}
+
+      <div className="notes">
+        <div className="notes-head">
+          <div className="notes-icon"><Icon name="fileText" size={18} /></div>
+          <div>
+            <div className="notes-title">Describe the situation</div>
+            <div className="notes-sub">
+              Describe the context in plain text. It's included in the Markdown and PDF exports.
+            </div>
+          </div>
+        </div>
+        <textarea
+          className="notes-input"
+          rows={5}
+          placeholder="e.g. Source DB sits behind a third-party firewall appliance not covered above, or a custom DNS forwarding setup we need to validate…"
+          value={state.notes || ""}
+          onChange={(e) => set("notes", e.target.value)}
+        />
+      </div>
 
       <div className="restart">
         <div className="restart-text">
@@ -2882,6 +2909,14 @@ function buildPdf({ jsPDF, conn, cloud, loc, net, state, checklist, checked, sum
     `Remaining high priority: ${summary.highRem}`,
     { size: 10.5, color: PRIO_TEXT.high, lineGap: 2 }
   );
+
+  // ── Describe the situation (free-text notes) ───────
+  if (state.notes && state.notes.trim()) {
+    y += 6;
+    drawHr();
+    drawText("Describe the situation", { size: 13, style: "bold", lineGap: 6 });
+    drawText(state.notes.trim(), { size: 10, color: [55, 65, 81], lineGap: 2 });
+  }
 
   return doc;
 }
